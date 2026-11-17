@@ -2,7 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabaseBrowser } from "@/lib/supabase";
+import { onAuthStateChanged, signOut, type User } from "firebase/auth";
+import {
+  addDoc,
+  collection,
+  getDocs,
+  query,
+  where,
+} from "firebase/firestore";
+import { firebaseAuth, firebaseDb, newPublicKey, toISO } from "@/lib/firebase";
 import type { Project } from "@/lib/types";
 
 export default function DashboardHome() {
@@ -10,44 +18,59 @@ export default function DashboardHome() {
   const [name, setName] = useState("");
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
   const router = useRouter();
 
   useEffect(() => {
-    (async () => {
-      const db = supabaseBrowser();
-      const { data: sess } = await db.auth.getSession();
-      if (!sess.session) { router.push("/dashboard/login"); return; }
-      const { data } = await db
-        .from("projects")
-        .select("*")
-        .order("created_at", { ascending: false });
-      setProjects((data as Project[]) || []);
+    const unsub = onAuthStateChanged(firebaseAuth(), async (u) => {
+      if (!u) { router.push("/dashboard/login"); return; }
+      setUser(u);
+      const snap = await getDocs(
+        query(collection(firebaseDb(), "projects"), where("owner_id", "==", u.uid))
+      );
+      const list: Project[] = snap.docs.map((d) => {
+        const data = d.data();
+        return {
+          id: d.id,
+          name: data.name as string,
+          public_key: data.public_key as string,
+          accent_color: (data.accent_color as string) || "#111111",
+          widget_position: (data.widget_position as "bottom-right" | "bottom-left") || "bottom-right",
+          theme: (data.theme as "light" | "dark") || "light",
+          language: (data.language as "en" | "es") || "en",
+          hide_badge: !!data.hide_badge,
+          created_at: toISO(data.created_at),
+        };
+      });
+      list.sort((a, b) => b.created_at.localeCompare(a.created_at));
+      setProjects(list);
       setLoading(false);
-    })();
+    });
+    return unsub;
   }, [router]);
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
-    if (!name.trim() || creating) return;
+    if (!name.trim() || creating || !user) return;
     setCreating(true);
-    const db = supabaseBrowser();
-    const { data: sess } = await db.auth.getSession();
-    const user = sess.session?.user;
-    if (!user) { router.push("/dashboard/login"); return; }
-    const { data, error } = await db
-      .from("projects")
-      .insert({ name: name.trim(), owner_id: user.id })
-      .select()
-      .single();
+    const ref = await addDoc(collection(firebaseDb(), "projects"), {
+      name: name.trim(),
+      owner_id: user.uid,
+      public_key: newPublicKey(),
+      accent_color: "#111111",
+      widget_position: "bottom-right",
+      theme: "light",
+      language: "en",
+      hide_badge: false,
+      created_at: new Date(),
+    });
     setCreating(false);
-    if (!error && data) {
-      setName("");
-      router.push(`/dashboard/${data.id}`);
-    }
+    setName("");
+    router.push(`/dashboard/${ref.id}`);
   }
 
-  async function signOut() {
-    await supabaseBrowser().auth.signOut();
+  async function doSignOut() {
+    await signOut(firebaseAuth());
     router.push("/dashboard/login");
   }
 
@@ -58,7 +81,7 @@ export default function DashboardHome() {
       <div className="dash-top">
         <h1>Your projects</h1>
         <span className="spacer" />
-        <button className="mini-btn" onClick={signOut}>Sign out</button>
+        <button className="mini-btn" onClick={doSignOut}>Sign out</button>
       </div>
 
       <div className="card" style={{ marginBottom: 24 }}>

@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { supabaseAdmin } from "@/lib/supabase";
+import { adminDb, toISO } from "@/lib/firebase-admin";
 import { bad, cleanStr, getProject, json, looksSpam, rateLimit } from "@/lib/public-api";
 
 export async function GET(req: NextRequest) {
@@ -8,17 +8,32 @@ export async function GET(req: NextRequest) {
   const project = await getProject(key);
   if (!project) return bad("unknown_project", 404);
 
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("suggestions")
-    .select("id,title,description,status,votes,created_at")
-    .eq("project_id", project.id)
-    .neq("status", "discarded")
-    .order("votes", { ascending: false })
-    .order("created_at", { ascending: false })
-    .limit(200);
-  if (error) return bad("db_error", 500);
-  return json({ suggestions: data });
+  const db = adminDb();
+  if (!db) return bad("db_error", 500);
+  const snap = await db
+    .collection("suggestions")
+    .where("project_id", "==", project.id)
+    .limit(200)
+    .get();
+  type Row = { id: string; title?: unknown; description?: unknown; status?: string; votes?: number; created_at?: unknown };
+  const rows: Row[] = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, unknown>) }));
+  const list = rows
+    .filter((s) => s.status !== "discarded")
+    .sort((a, b) => {
+      const av = a.votes ?? 0;
+      const bv = b.votes ?? 0;
+      if (bv !== av) return bv - av;
+      return toISO(b.created_at).localeCompare(toISO(a.created_at));
+    })
+    .map((s) => ({
+      id: s.id,
+      title: s.title,
+      description: s.description,
+      status: s.status,
+      votes: s.votes ?? 0,
+      created_at: toISO(s.created_at),
+    }));
+  return json({ suggestions: list });
 }
 
 export async function POST(req: NextRequest) {
@@ -45,17 +60,30 @@ export async function POST(req: NextRequest) {
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return bad("bad_email");
   if (looksSpam(title + " " + description)) return bad("spam_detected");
 
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("suggestions")
-    .insert({
-      project_id: project.id,
-      title,
-      description,
-      voter_email: email || null,
-    })
-    .select("id,title,description,status,votes,created_at")
-    .single();
-  if (error) return bad("db_error", 500);
-  return json({ ok: true, suggestion: data }, 201);
+  const db = adminDb();
+  if (!db) return bad("db_error", 500);
+  const now = new Date();
+  const ref = await db.collection("suggestions").add({
+    project_id: project.id,
+    title,
+    description,
+    voter_email: email || null,
+    status: "open",
+    votes: 0,
+    created_at: now,
+  });
+  return json(
+    {
+      ok: true,
+      suggestion: {
+        id: ref.id,
+        title,
+        description,
+        status: "open",
+        votes: 0,
+        created_at: now.toISOString(),
+      },
+    },
+    201
+  );
 }

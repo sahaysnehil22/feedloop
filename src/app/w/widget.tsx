@@ -50,10 +50,12 @@ export default function Widget({ projKey, init }: { projKey: string; init: Parti
   const [toast, setToast] = useState<{ msg: string; err?: boolean } | null>(null);
   const [unread, setUnread] = useState(0);
   const [broken, setBroken] = useState(false);
+  const [loading, setLoading] = useState(true);
   const voter = useMemo(() => voterIdFor(projKey), [projKey]);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const load = useCallback(async () => {
+    setLoading(true);
     try {
       const [c, sg, ne] = await Promise.all([
         fetch(`/api/public/config?key=${encodeURIComponent(projKey)}`).then((r) => (r.ok ? r.json() : null)),
@@ -82,6 +84,8 @@ export default function Widget({ projKey, init }: { projKey: string; init: Parti
       } catch { /* ignore */ }
     } catch {
       setBroken(true);
+    } finally {
+      setLoading(false);
     }
   }, [projKey]);
 
@@ -177,7 +181,7 @@ export default function Widget({ projKey, init }: { projKey: string; init: Parti
     return (
       <div className="widget-shell" data-theme={cfg.theme}>
         <div className="widget-body">
-          <div className="toast err">FeedLoop: unknown project key.</div>
+          <div className="toast err">{s["widget.broken"]}</div>
         </div>
       </div>
     );
@@ -270,10 +274,12 @@ export default function Widget({ projKey, init }: { projKey: string; init: Parti
                 </div>
               </form>
             )}
-            {filtered.length === 0 && (
+            {loading ? (
+              <div className="empty">{s["widget.loading"]}</div>
+            ) : filtered.length === 0 ? (
               <div className="empty">{search ? s["widget.emptySearch"] : s["widget.empty"]}</div>
-            )}
-            {filtered.map((x) => (
+            ) : (
+              filtered.map((x) => (
               <div className="sugg" key={x.id}>
                 <div className="sugg-top">
                   <button
@@ -294,13 +300,16 @@ export default function Widget({ projKey, init }: { projKey: string; init: Parti
                   </div>
                 </div>
               </div>
-            ))}
+            )))}
           </>
         )}
 
         {tab === "roadmap" && (
           <>
-            {ROADMAP_STATUSES.map((st) => {
+            {loading ? (
+              <div className="empty">{s["widget.loading"]}</div>
+            ) : (
+              ROADMAP_STATUSES.map((st) => {
               const items = suggestions.filter((x) => x.status === st);
               return (
                 <div key={st} style={{ marginBottom: 18 }}>
@@ -316,14 +325,18 @@ export default function Widget({ projKey, init }: { projKey: string; init: Parti
                   ))}
                 </div>
               );
-            })}
+            }))}
           </>
         )}
 
         {tab === "news" && (
           <>
-            {entries.length === 0 && <div className="empty">{s["widget.news.empty"]}</div>}
-            {entries.map((e) => (
+            {loading ? (
+              <div className="empty">{s["widget.loading"]}</div>
+            ) : entries.length === 0 ? (
+              <div className="empty">{s["widget.news.empty"]}</div>
+            ) : (
+              entries.map((e) => (
               <div className="news-item" key={e.id}>
                 <div className="date">
                   {new Date(e.published_at).toLocaleDateString(cfg.language === "es" ? "es-ES" : "en-US", {
@@ -333,7 +346,7 @@ export default function Widget({ projKey, init }: { projKey: string; init: Parti
                 <h4>{e.title}</h4>
                 {e.body && <p>{e.body}</p>}
               </div>
-            ))}
+            )))}
           </>
         )}
       </div>

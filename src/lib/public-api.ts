@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabase";
+import { adminDb, toISO } from "@/lib/firebase-admin";
 import type { Project } from "@/lib/types";
 
 export function json(data: unknown, status = 200) {
@@ -34,14 +34,27 @@ const KEY_RE = /^pk_[0-9a-f]{16,64}$/;
 
 export async function getProject(key: unknown): Promise<Project | null> {
   if (typeof key !== "string" || !KEY_RE.test(key)) return null;
-  const db = supabaseAdmin();
-  const { data, error } = await db
-    .from("projects")
-    .select("id,name,public_key,accent_color,widget_position,theme,language,hide_badge,created_at")
-    .eq("public_key", key)
-    .single();
-  if (error || !data) return null;
-  return data as Project;
+  const db = adminDb();
+  if (!db) return null;
+  const snap = await db
+    .collection("projects")
+    .where("public_key", "==", key)
+    .limit(1)
+    .get();
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  const d = doc.data();
+  return {
+    id: doc.id,
+    name: d.name as string,
+    public_key: d.public_key as string,
+    accent_color: (d.accent_color as string) || "#111111",
+    widget_position: (d.widget_position as "bottom-right" | "bottom-left") || "bottom-right",
+    theme: (d.theme as "light" | "dark") || "light",
+    language: (d.language as "en" | "es") || "en",
+    hide_badge: !!d.hide_badge,
+    created_at: toISO(d.created_at),
+  };
 }
 
 const BANNED = [

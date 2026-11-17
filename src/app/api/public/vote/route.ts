@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { supabaseAdmin } from "@/lib/supabase";
+import { adminDb } from "@/lib/firebase-admin";
 import { bad, getProject, json, rateLimit } from "@/lib/public-api";
 
 const VOTER_RE = /^[A-Za-z0-9_-]{8,128}$/;
@@ -21,37 +21,45 @@ export async function POST(req: NextRequest) {
   const action = body.action === "down" ? "down" : "up";
   if (!VOTER_RE.test(voterId)) return bad("bad_voter");
 
-  const db = supabaseAdmin();
+  const db = adminDb();
+  if (!db) return bad("db_error", 500);
 
-  // Make sure the suggestion belongs to this project and is votable.
-  const { data: sugg } = await db
-    .from("suggestions")
-    .select("id,project_id,status")
-    .eq("id", suggestionId)
-    .eq("project_id", project.id)
-    .single();
-  if (!sugg || sugg.status === "discarded") return bad("unknown_suggestion", 404);
+  const suggRef = db.collection("suggestions").doc(suggestionId);
+  const voteRef = db.collection("votes").doc(`${suggestionId}_${voterId}`);
 
-  if (action === "up") {
-    const { error } = await db
-      .from("votes")
-      .insert({ suggestion_id: suggestionId, voter_id: voterId });
-    if (error) {
-      // 23505 = already voted; treat as idempotent success.
-      if (error.code !== "23505") return bad("db_error", 500);
+  let votes = 0;
+  try {
+    votes = await db.runTransaction(async (tx) => {
+      const suggSnap = await tx.get(suggRef);
+      if (!suggSnap.exists) throw new Error("unknown_suggestion");
+      const sugg = suggSnap.data()!;
+      if (sugg.project_id !== project.id || sugg.status === "discarded") {
+        throw new Error("unknown_suggestion");
+      }
+      const voteSnap = await tx.get(voteRef);
+      const current = typeof sugg.votes === "number" ? sugg.votes : 0;
+      if (action === "up") {
+        if (!voteSnap.exists) {
+          tx.set(voteRef, { suggestion_id: suggestionId, voter_id: voterId, created_at: new Date() });
+          tx.update(suggRef, { votes: current + 1 });
+          return current + 1;
+        }
+        return current;
+      }
+      // down
+      if (voteSnap.exists) {
+        tx.delete(voteRef);
+        tx.update(suggRef, { votes: Math.max(0, current - 1) });
+        return Math.max(0, current - 1);
+      }
+      return current;
+    });
+  } catch (e) {
+    if (e instanceof Error && e.message === "unknown_suggestion") {
+      return bad("unknown_suggestion", 404);
     }
-  } else {
-    await db
-      .from("votes")
-      .delete()
-      .eq("suggestion_id", suggestionId)
-      .eq("voter_id", voterId);
+    return bad("db_error", 500);
   }
 
-  const { data: updated } = await db
-    .from("suggestions")
-    .select("votes")
-    .eq("id", suggestionId)
-    .single();
-  return json({ ok: true, votes: updated?.votes ?? 0, voted: action === "up" });
+  return json({ ok: true, votes, voted: action === "up" });
 }

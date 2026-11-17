@@ -2,7 +2,20 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { supabaseBrowser, appUrl } from "@/lib/supabase";
+import { onAuthStateChanged, type User } from "firebase/auth";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  query,
+  updateDoc,
+  where,
+  writeBatch,
+} from "firebase/firestore";
+import { firebaseAuth, firebaseDb, appUrl, toISO } from "@/lib/firebase";
 import { ROADMAP_STATUSES, STATUSES, type ChangelogEntry, type InternalNote, type Project, type Status, type Suggestion } from "@/lib/types";
 
 type Tab = "suggestions" | "roadmap" | "changelog" | "settings";
@@ -14,6 +27,7 @@ export default function ProjectDetail() {
   const id = params.id;
   const router = useRouter();
 
+  const [user, setUser] = useState<User | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [entries, setEntries] = useState<ChangelogEntry[]>([]);
@@ -34,126 +48,168 @@ export default function ProjectDetail() {
   const [deleteConfirm, setDeleteConfirm] = useState("");
 
   const load = useCallback(async () => {
-    const db = supabaseBrowser();
-    const { data: sess } = await db.auth.getSession();
-    if (!sess.session) { router.push("/dashboard/login"); return; }
-    const { data: proj } = await db.from("projects").select("*").eq("id", id).single();
-    if (!proj) { router.push("/dashboard"); return; }
-    setProject(proj as Project);
-    setForm({
-      name: proj.name,
-      accent_color: proj.accent_color,
-      widget_position: proj.widget_position,
-      theme: proj.theme,
-      language: proj.language,
-      hide_badge: proj.hide_badge,
+    const db = firebaseDb();
+    const projSnap = await getDoc(doc(db, "projects", id));
+    if (!projSnap.exists()) { router.push("/dashboard"); return; }
+    const proj = projSnap.data();
+    setProject({
+      id: projSnap.id,
+      name: proj.name as string,
+      public_key: proj.public_key as string,
+      accent_color: (proj.accent_color as string) || "#111111",
+      widget_position: (proj.widget_position as "bottom-right" | "bottom-left") || "bottom-right",
+      theme: (proj.theme as "light" | "dark") || "light",
+      language: (proj.language as "en" | "es") || "en",
+      hide_badge: !!proj.hide_badge,
+      created_at: toISO(proj.created_at),
     });
-    const [{ data: sg }, { data: ne }] = await Promise.all([
-      db.from("suggestions").select("*").eq("project_id", id).order("votes", { ascending: false }),
-      db.from("changelog_entries").select("*").eq("project_id", id).order("published_at", { ascending: false }),
+    setForm({
+      name: proj.name as string,
+      accent_color: (proj.accent_color as string) || "#111111",
+      widget_position: (proj.widget_position as string) || "bottom-right",
+      theme: (proj.theme as string) || "light",
+      language: (proj.language as string) || "en",
+      hide_badge: !!proj.hide_badge,
+    });
+    const [sgSnap, neSnap] = await Promise.all([
+      getDocs(query(collection(db, "suggestions"), where("project_id", "==", id))),
+      getDocs(query(collection(db, "changelog_entries"), where("project_id", "==", id))),
     ]);
-    setSuggestions((sg as Suggestion[]) || []);
-    setEntries((ne as ChangelogEntry[]) || []);
+    const sg: Suggestion[] = sgSnap.docs.map((d) => {
+      const data = d.data();
+      return {
+        id: d.id,
+        project_id: data.project_id as string,
+        title: data.title as string,
+        description: (data.description as string) || "",
+        status: data.status as Status,
+        votes: (data.votes as number) ?? 0,
+        created_at: toISO(data.created_at),
+      };
+    });
+    sg.sort((a, b) => b.votes - a.votes || b.created_at.localeCompare(a.created_at));
+    setSuggestions(sg);
+    const ne: ChangelogEntry[] = neSnap.docs.map((d) => {
+      const data = d.data();
+      return {
+        id: d.id,
+        project_id: data.project_id as string,
+        title: data.title as string,
+        body: (data.body as string) || "",
+        suggestion_id: (data.suggestion_id as string) || null,
+        published_at: toISO(data.published_at),
+      };
+    });
+    ne.sort((a, b) => b.published_at.localeCompare(a.published_at));
+    setEntries(ne);
     setLoading(false);
   }, [id, router]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const unsub = onAuthStateChanged(firebaseAuth(), (u) => {
+      if (!u) { router.push("/dashboard/login"); return; }
+      setUser(u);
+      load();
+    });
+    return unsub;
+  }, [load, router]);
 
   async function setStatus(suggId: string, status: Status) {
-    const db = supabaseBrowser();
-    const { error } = await db.from("suggestions").update({ status }).eq("id", suggId);
-    if (!error) setSuggestions((p) => p.map((x) => (x.id === suggId ? { ...x, status } : x)));
+    await updateDoc(doc(firebaseDb(), "suggestions", suggId), { status });
+    setSuggestions((p) => p.map((x) => (x.id === suggId ? { ...x, status } : x)));
   }
 
   async function removeSuggestion(suggId: string) {
     if (!confirm("Delete this suggestion?")) return;
-    const db = supabaseBrowser();
-    const { error } = await db.from("suggestions").delete().eq("id", suggId);
-    if (!error) setSuggestions((p) => p.filter((x) => x.id !== suggId));
+    await deleteDoc(doc(firebaseDb(), "suggestions", suggId));
+    setSuggestions((p) => p.filter((x) => x.id !== suggId));
   }
 
   async function toggleNotes(suggId: string) {
     const open = !openNotes[suggId];
     setOpenNotes((p) => ({ ...p, [suggId]: open }));
     if (open && !notes[suggId]) {
-      const db = supabaseBrowser();
-      const { data } = await db.from("internal_notes").select("*").eq("suggestion_id", suggId).order("created_at", { ascending: true });
-      setNotes((p) => ({ ...p, [suggId]: (data as InternalNote[]) || [] }));
+      const snap = await getDocs(
+        query(collection(firebaseDb(), "internal_notes"), where("suggestion_id", "==", suggId))
+      );
+      const list: InternalNote[] = snap.docs.map((d) => {
+        const data = d.data();
+        return { id: d.id, suggestion_id: data.suggestion_id as string, body: data.body as string, created_at: toISO(data.created_at) };
+      });
+      list.sort((a, b) => a.created_at.localeCompare(b.created_at));
+      setNotes((p) => ({ ...p, [suggId]: list }));
     }
   }
 
   async function addNote(suggId: string) {
     const body = (noteDrafts[suggId] || "").trim();
-    if (!body) return;
-    const db = supabaseBrowser();
-    const { data: sess } = await db.auth.getSession();
-    const user = sess.session?.user;
-    if (!user) return;
-    const { data, error } = await db
-      .from("internal_notes")
-      .insert({ suggestion_id: suggId, author_id: user.id, body })
-      .select()
-      .single();
-    if (!error && data) {
-      setNotes((p) => ({ ...p, [suggId]: [...(p[suggId] || []), data as InternalNote] }));
-      setNoteDrafts((p) => ({ ...p, [suggId]: "" }));
-    }
+    if (!body || !user) return;
+    const ref = await addDoc(collection(firebaseDb(), "internal_notes"), {
+      suggestion_id: suggId,
+      author_id: user.uid,
+      body,
+      created_at: new Date(),
+    });
+    setNotes((p) => ({
+      ...p,
+      [suggId]: [...(p[suggId] || []), { id: ref.id, suggestion_id: suggId, body, created_at: new Date().toISOString() }],
+    }));
+    setNoteDrafts((p) => ({ ...p, [suggId]: "" }));
   }
 
   async function publishNews(e: React.FormEvent) {
     e.preventDefault();
     if (!newsTitle.trim()) return;
-    const db = supabaseBrowser();
-    const { data, error } = await db
-      .from("changelog_entries")
-      .insert({
-        project_id: id,
-        title: newsTitle.trim(),
-        body: newsBody.trim(),
-        suggestion_id: newsLink || null,
-      })
-      .select()
-      .single();
-    if (!error && data) {
-      setEntries((p) => [data as ChangelogEntry, ...p]);
-      setNewsTitle(""); setNewsBody(""); setNewsLink("");
-      if (newsLink) setStatus(newsLink, "launched");
-    }
+    const now = new Date();
+    const ref = await addDoc(collection(firebaseDb(), "changelog_entries"), {
+      project_id: id,
+      title: newsTitle.trim(),
+      body: newsBody.trim(),
+      suggestion_id: newsLink || null,
+      published_at: now,
+    });
+    setEntries((p) => [
+      { id: ref.id, project_id: id, title: newsTitle.trim(), body: newsBody.trim(), suggestion_id: newsLink || null, published_at: now.toISOString() },
+      ...p,
+    ]);
+    setNewsTitle(""); setNewsBody(""); setNewsLink("");
+    if (newsLink) setStatus(newsLink, "launched");
   }
 
   async function removeEntry(entryId: string) {
     if (!confirm("Delete this update?")) return;
-    const db = supabaseBrowser();
-    const { error } = await db.from("changelog_entries").delete().eq("id", entryId);
-    if (!error) setEntries((p) => p.filter((x) => x.id !== entryId));
+    await deleteDoc(doc(firebaseDb(), "changelog_entries", entryId));
+    setEntries((p) => p.filter((x) => x.id !== entryId));
   }
 
   async function saveSettings(e: React.FormEvent) {
     e.preventDefault();
-    const db = supabaseBrowser();
-    const { error } = await db
-      .from("projects")
-      .update({
-        name: form.name.trim() || project!.name,
-        accent_color: form.accent_color,
-        widget_position: form.widget_position,
-        theme: form.theme,
-        language: form.language,
-        hide_badge: form.hide_badge,
-      })
-      .eq("id", id);
-    if (!error) {
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
-      load();
-    }
+    await updateDoc(doc(firebaseDb(), "projects", id), {
+      name: form.name.trim() || project!.name,
+      accent_color: form.accent_color,
+      widget_position: form.widget_position,
+      theme: form.theme,
+      language: form.language,
+      hide_badge: form.hide_badge,
+    });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2500);
+    load();
   }
 
   async function deleteProject() {
     if (deleteConfirm !== "DELETE") return;
-    const db = supabaseBrowser();
-    const { error } = await db.from("projects").delete().eq("id", id);
-    if (!error) router.push("/dashboard");
+    const db = firebaseDb();
+    const batch = writeBatch(db);
+    const [sgSnap, neSnap] = await Promise.all([
+      getDocs(query(collection(db, "suggestions"), where("project_id", "==", id))),
+      getDocs(query(collection(db, "changelog_entries"), where("project_id", "==", id))),
+    ]);
+    sgSnap.docs.forEach((d) => batch.delete(d.ref));
+    neSnap.docs.forEach((d) => batch.delete(d.ref));
+    batch.delete(doc(db, "projects", id));
+    await batch.commit();
+    router.push("/dashboard");
   }
 
   function moveRoadmap(suggId: string, dir: -1 | 1) {

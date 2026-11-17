@@ -2,7 +2,11 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabaseBrowser } from "@/lib/supabase";
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+} from "firebase/auth";
+import { firebaseAuth } from "@/lib/firebase";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -17,12 +21,12 @@ export default function LoginPage() {
     setError("");
     setBusy(true);
     try {
-      const db = supabaseBrowser();
-      const res =
-        mode === "in"
-          ? await db.auth.signInWithPassword({ email, password })
-          : await db.auth.signUp({ email, password });
-      if (res.error) throw res.error;
+      const auth = firebaseAuth();
+      if (mode === "in") {
+        await signInWithEmailAndPassword(auth, email, password);
+      } else {
+        await createUserWithEmailAndPassword(auth, email, password);
+      }
       router.push("/dashboard");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sign in failed");
